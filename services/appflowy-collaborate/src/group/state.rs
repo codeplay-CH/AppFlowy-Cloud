@@ -36,9 +36,8 @@ impl GroupManagementState {
     }
   }
 
-  /// Performs a periodic check to remove groups based on the following conditions:
-  /// Groups that have been inactive for a specified period of time.
-  pub fn get_inactive_group_ids(&self) -> Vec<String> {
+  /// Returns group ids of inactive groups.
+  pub fn remove_inactive_groups(&self) -> Vec<String> {
     let mut inactive_group_ids = vec![];
     for entry in self.group_by_object_id.iter() {
       let (object_id, group) = (entry.key(), entry.value());
@@ -65,7 +64,9 @@ impl GroupManagementState {
 
     loop {
       match self.group_by_object_id.try_get(object_id) {
-        TryResult::Present(group) => return Some(group.clone()),
+        TryResult::Present(group) => {
+          return Some(group.clone());
+        },
         TryResult::Absent => return None,
         TryResult::Locked => {
           attempts += 1;
@@ -107,22 +108,29 @@ impl GroupManagementState {
     }
   }
 
-  pub(crate) fn insert_group(&self, object_id: &str, group: Arc<CollabGroup>) {
-    self.group_by_object_id.insert(object_id.to_string(), group);
+  pub(crate) fn insert_group(&self, object_id: &str, group: CollabGroup) {
+    self
+      .group_by_object_id
+      .insert(object_id.to_string(), group.into());
     self.metrics_calculate.opening_collab_count.inc();
   }
 
   pub(crate) fn contains_group(&self, object_id: &str) -> bool {
-    self.group_by_object_id.contains_key(object_id)
+    if let Some(group) = self.group_by_object_id.get(object_id) {
+      let cancelled = group.is_cancelled();
+      !cancelled
+    } else {
+      false
+    }
   }
 
   pub(crate) fn remove_group(&self, object_id: &str) {
-    let entry = self.group_by_object_id.remove(object_id);
-
-    if entry.is_none() {
+    let group_not_found = self.group_by_object_id.remove(object_id).is_none();
+    if group_not_found {
       // Log error if the group doesn't exist
       error!("Group for object_id:{} not found", object_id);
     }
+
     self
       .metrics_calculate
       .opening_collab_count

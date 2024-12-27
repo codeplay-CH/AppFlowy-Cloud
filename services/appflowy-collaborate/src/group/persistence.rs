@@ -1,20 +1,20 @@
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::Duration;
 
+use crate::group::group_init::EditState;
 use anyhow::anyhow;
+use app_error::AppError;
 use collab::lock::RwLock;
 use collab::preclude::Collab;
+use collab_document::document::DocumentBody;
 use collab_entity::{validate_data_for_folder, CollabType};
+use database::collab::CollabStorage;
+use database_entity::dto::CollabParams;
+use indexer::scheduler::{IndexerScheduler, UnindexedCollabTask, UnindexedData};
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{trace, warn};
-
-use app_error::AppError;
-use database::collab::CollabStorage;
-use database_entity::dto::CollabParams;
-
-use crate::group::group_init::EditState;
-use crate::indexer::Indexer;
+use uuid::Uuid;
 
 pub(crate) struct GroupPersistence<S> {
   workspace_id: String,
@@ -22,10 +22,12 @@ pub(crate) struct GroupPersistence<S> {
   storage: Arc<S>,
   uid: i64,
   edit_state: Arc<EditState>,
-  collab: Weak<RwLock<Collab>>,
+  /// Use Arc<RwLock<Collab>> instead of Weak<RwLock<Collab>> to make sure the collab is not dropped
+  /// when saving collab data to disk
+  collab: Arc<RwLock<Collab>>,
   collab_type: CollabType,
   persistence_interval: Duration,
-  indexer: Option<Arc<dyn Indexer>>,
+  indexer_scheduler: Arc<IndexerScheduler>,
   cancel: CancellationToken,
 }
 
@@ -40,10 +42,10 @@ where
     uid: i64,
     storage: Arc<S>,
     edit_state: Arc<EditState>,
-    collab: Weak<RwLock<Collab>>,
+    collab: Arc<RwLock<Collab>>,
     collab_type: CollabType,
     persistence_interval: Duration,
-    ai_client: Option<Arc<dyn Indexer>>,
+    indexer_scheduler: Arc<IndexerScheduler>,
     cancel: CancellationToken,
   ) -> Self {
     Self {
@@ -55,7 +57,7 @@ where
       collab,
       collab_type,
       persistence_interval,
-      indexer: ai_client,
+      indexer_scheduler,
       cancel,
     }
   }
@@ -65,7 +67,6 @@ where
     loop {
       // delay 30 seconds before the first save. We don't want to save immediately after the collab is created
       tokio::time::sleep(Duration::from_secs(30)).await;
-
       tokio::select! {
         _ = interval.tick() => {
           if self.attempt_save().await.is_err() {
@@ -81,8 +82,8 @@ where
   }
 
   async fn force_save(&self) {
-    if self.edit_state.is_new() && self.save(true).await.is_ok() {
-      self.edit_state.set_is_new(false);
+    if self.edit_state.is_new_create() && self.save(true).await.is_ok() {
+      self.edit_state.set_is_new_create(false);
       return;
     }
 
@@ -91,7 +92,7 @@ where
       return;
     }
 
-    if let Err(err) = self.save(false).await {
+    if let Err(err) = self.save(true).await {
       warn!("fail to force save: {}:{:?}", self.object_id, err);
     }
   }
@@ -101,12 +102,12 @@ where
     trace!("collab:{} edit state: {}", self.object_id, self.edit_state);
 
     // Check if conditions for saving to disk are not met
-    let is_new = self.edit_state.is_new();
+    let is_new = self.edit_state.is_new_create();
     if self.edit_state.should_save_to_disk() {
       match self.save(is_new).await {
         Ok(_) => {
           if is_new {
-            self.edit_state.set_is_new(false);
+            self.edit_state.set_is_new_create(false);
           }
         },
         Err(err) => {
@@ -117,55 +118,47 @@ where
     Ok(())
   }
 
-  async fn save(&self, write_immediately: bool) -> Result<(), AppError> {
+  async fn save(&self, flush_to_disk: bool) -> Result<(), AppError> {
     let object_id = self.object_id.clone();
     let workspace_id = self.workspace_id.clone();
     let collab_type = self.collab_type.clone();
-    let collab = match self.collab.upgrade() {
-      Some(collab) => collab,
-      None => return Err(AppError::Internal(anyhow!("collab has been dropped"))),
-    };
 
-    let params = {
-      let cloned_collab = collab.clone();
-      let (workspace_id, mut params, object_id) = tokio::task::spawn_blocking(move || {
-        let collab = cloned_collab.blocking_read();
-        let params = get_encode_collab(&workspace_id, &object_id, &collab, &collab_type)?;
-        Ok::<_, AppError>((workspace_id, params, object_id))
-      })
-      .await??;
+    let cloned_collab = self.collab.clone();
+    let indexer_scheduler = self.indexer_scheduler.clone();
 
-      let lock = collab.read().await;
-      if let Some(indexer) = &self.indexer {
-        match indexer.embedding_params(&lock).await {
-          Ok(embedding_params) => {
-            drop(lock); // we no longer need the lock
-            match indexer.embeddings(embedding_params).await {
-              Ok(embeddings) => {
-                params.embeddings = embeddings;
-              },
-              Err(err) => {
-                warn!(
-                  "failed to index embeddings from remote service for document {}/{}: {}",
-                  workspace_id, object_id, err
-                );
-              },
-            }
-          },
-          Err(err) => {
-            warn!(
-              "failed to get embedding params for document {}/{}: {}",
-              workspace_id, object_id, err
+    let params = tokio::task::spawn_blocking(move || {
+      let collab = cloned_collab.blocking_read();
+      let params = get_encode_collab(&workspace_id, &object_id, &collab, &collab_type)?;
+      match collab_type {
+        CollabType::Document => {
+          let txn = collab.transact();
+          let text = DocumentBody::from_collab(&collab)
+            .and_then(|doc| doc.to_plain_text(txn, false, true).ok());
+
+          if let Some(text) = text {
+            let pending = UnindexedCollabTask::new(
+              Uuid::parse_str(&workspace_id)?,
+              object_id.clone(),
+              collab_type,
+              UnindexedData::UnindexedText(text),
             );
-          },
-        }
+            if let Err(err) = indexer_scheduler.index_pending_collab_one(pending, true) {
+              warn!("fail to index collab: {}:{}", object_id, err);
+            }
+          }
+        },
+        _ => {
+          // TODO(nathan): support other collab types
+        },
       }
-      params
-    };
+
+      Ok::<_, AppError>(params)
+    })
+    .await??;
 
     self
       .storage
-      .queue_insert_or_update_collab(&self.workspace_id, &self.uid, params, write_immediately)
+      .queue_insert_or_update_collab(&self.workspace_id, &self.uid, params, flush_to_disk)
       .await?;
     // Update the edit state on successful save
     self.edit_state.tick();
@@ -214,7 +207,6 @@ fn get_encode_collab(
     object_id: object_id.to_string(),
     encoded_collab_v1: encoded_collab.into(),
     collab_type: collab_type.clone(),
-    embeddings: None,
   };
   Ok(params)
 }

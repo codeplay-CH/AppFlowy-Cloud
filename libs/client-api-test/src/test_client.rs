@@ -37,12 +37,15 @@ use client_api::entity::{
 };
 use client_api::ws::{WSClient, WSClientConfig};
 use database_entity::dto::{
-  AFRole, AFSnapshotMeta, AFSnapshotMetas, AFUserProfile, AFUserWorkspaceInfo, AFWorkspace,
-  AFWorkspaceInvitationStatus, AFWorkspaceMember, BatchQueryCollabResult, CollabParams,
-  CreateCollabParams, QueryCollab, QueryCollabParams, QuerySnapshotParams, SnapshotData,
+  AFCollabEmbedInfo, AFRole, AFSnapshotMeta, AFSnapshotMetas, AFUserProfile, AFUserWorkspaceInfo,
+  AFWorkspace, AFWorkspaceInvitationStatus, AFWorkspaceMember, BatchQueryCollabResult,
+  CollabParams, CreateCollabParams, QueryCollab, QueryCollabParams, QuerySnapshotParams,
+  SnapshotData,
 };
+use shared_entity::dto::ai_dto::CalculateSimilarityParams;
+use shared_entity::dto::search_dto::SearchDocumentResponseItem;
 use shared_entity::dto::workspace_dto::{
-  BlobMetadata, CollabResponse, PublishedDuplicate, WorkspaceMemberChangeset,
+  BlobMetadata, CollabResponse, EmbeddedCollabQuery, PublishedDuplicate, WorkspaceMemberChangeset,
   WorkspaceMemberInvitation, WorkspaceSpaceUsage,
 };
 use shared_entity::response::AppResponseError;
@@ -63,8 +66,18 @@ pub struct TestClient {
 pub struct TestCollab {
   #[allow(dead_code)]
   pub origin: CollabOrigin,
-  pub collab: Arc<RwLock<dyn BorrowMut<Collab> + Send + Sync + 'static>>,
+  pub collab: Arc<RwLock<Collab>>,
 }
+
+impl TestCollab {
+  pub async fn encode_collab(&self) -> EncodedCollab {
+    let lock = self.collab.read().await;
+    lock
+      .encode_collab_v1(|_| Ok::<(), anyhow::Error>(()))
+      .unwrap()
+  }
+}
+
 impl TestClient {
   pub async fn new(registered_user: User, start_ws_conn: bool) -> Self {
     load_env();
@@ -204,8 +217,7 @@ impl TestClient {
     }
 
     let lock = self.collabs.get(object_id).unwrap().collab.read().await;
-    let collab = (*lock).borrow();
-    collab
+    lock
       .get_awareness()
       .iter()
       .flat_map(|(_a, client)| match &client.data {
@@ -285,6 +297,26 @@ impl TestClient {
       false,
     )
     .unwrap()
+  }
+
+  pub async fn create_document_collab(&self, workspace_id: &str, object_id: &str) -> Document {
+    let collab_resp = self
+      .get_collab(
+        workspace_id.to_string(),
+        object_id.to_string(),
+        CollabType::Document,
+      )
+      .await
+      .unwrap();
+    let collab = Collab::new_with_source(
+      CollabOrigin::Server,
+      object_id,
+      collab_resp.encode_collab.into(),
+      vec![],
+      false,
+    )
+    .unwrap();
+    Document::open(collab).unwrap()
   }
 
   pub async fn get_db_collab_from_view(&mut self, workspace_id: &str, view_id: &str) -> Collab {
@@ -368,7 +400,12 @@ impl TestClient {
       .api_client
       .invite_workspace_members(
         workspace_id,
-        vec![WorkspaceMemberInvitation { email, role }],
+        vec![WorkspaceMemberInvitation {
+          email,
+          role,
+          skip_email_send: true,
+          ..Default::default()
+        }],
       )
       .await?;
 
@@ -453,8 +490,7 @@ impl TestClient {
   ) -> Result<(), Error> {
     let mut sync_state = {
       let lock = self.collabs.get(object_id).unwrap().collab.read().await;
-      let collab = (*lock).borrow();
-      collab.subscribe_sync_state()
+      lock.subscribe_sync_state()
     };
 
     let duration = Duration::from_secs(secs);
@@ -518,6 +554,107 @@ impl TestClient {
 
   pub async fn get_user_profile(&self) -> AFUserProfile {
     self.api_client.get_profile().await.unwrap()
+  }
+
+  pub async fn wait_until_all_embedding(
+    &self,
+    workspace_id: &str,
+    query: Vec<EmbeddedCollabQuery>,
+  ) -> Vec<AFCollabEmbedInfo> {
+    let timeout_duration = Duration::from_secs(30);
+    let poll_interval = Duration::from_millis(2000);
+    let poll_fut = async {
+      loop {
+        match self
+          .api_client
+          .batch_get_collab_embed_info(workspace_id, query.clone())
+          .await
+        {
+          Ok(items) if items.len() == query.len() => return Ok::<_, Error>(items),
+          _ => tokio::time::sleep(poll_interval).await,
+        }
+      }
+    };
+
+    // Enforce timeout
+    match timeout(timeout_duration, poll_fut).await {
+      Ok(Ok(items)) => items,
+      Ok(Err(e)) => panic!("Test failed: {}", e),
+      Err(_) => panic!("Test failed: Timeout after 30 seconds."),
+    }
+  }
+
+  pub async fn wait_until_get_embedding(&self, workspace_id: &str, object_id: &str) {
+    let result = timeout(Duration::from_secs(30), async {
+      while self
+        .api_client
+        .get_collab_embed_info(workspace_id, object_id, CollabType::Document)
+        .await
+        .is_err()
+      {
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+      }
+      self
+        .api_client
+        .get_collab_embed_info(workspace_id, object_id, CollabType::Document)
+        .await
+    })
+    .await;
+
+    match result {
+      Ok(Ok(_)) => {},
+      Ok(Err(e)) => panic!("Test failed: API returned an error: {:?}", e),
+      Err(_) => panic!("Test failed: Timeout after 30 seconds."),
+    }
+  }
+
+  pub async fn wait_unit_get_search_result(
+    &self,
+    workspace_id: &str,
+    query: &str,
+    limit: u32,
+  ) -> Vec<SearchDocumentResponseItem> {
+    timeout(Duration::from_secs(30), async {
+      loop {
+        let response = self
+          .api_client
+          .search_documents(workspace_id, query, limit, 200)
+          .await
+          .unwrap();
+
+        if response.is_empty() {
+          tokio::time::sleep(Duration::from_millis(1500)).await;
+          continue;
+        } else {
+          return response;
+        }
+      }
+    })
+    .await
+    .unwrap()
+  }
+
+  pub async fn assert_similarity(
+    &self,
+    workspace_id: &str,
+    input: &str,
+    expected: &str,
+    score: f64,
+  ) {
+    let params = CalculateSimilarityParams {
+      workspace_id: workspace_id.to_string(),
+      input: input.to_string(),
+      expected: expected.to_string(),
+    };
+    let resp = self.api_client.calculate_similarity(params).await.unwrap();
+    assert!(
+      resp.score > score,
+      "Similarity score is too low: {}.\nexpected: {},\ninput: {},\nexpected:{}",
+      resp.score,
+      score,
+      input,
+      expected
+    );
   }
 
   pub async fn get_snapshot(
@@ -696,7 +833,8 @@ impl TestClient {
       .await
       .unwrap();
 
-    let collab = Arc::new(RwLock::from(collab)) as CollabRef;
+    let collab = Arc::new(RwLock::from(collab));
+    let collab_ref = collab.clone() as CollabRef;
     #[cfg(feature = "collab-sync")]
     {
       let handler = self
@@ -709,7 +847,7 @@ impl TestClient {
       let sync_plugin = SyncPlugin::new(
         origin.clone(),
         object,
-        Arc::downgrade(&collab),
+        Arc::downgrade(&collab_ref),
         sink,
         SinkConfig::default(),
         stream,
@@ -718,8 +856,7 @@ impl TestClient {
         Some(Duration::from_secs(10)),
       );
       let lock = collab.read().await;
-      let collab = (*lock).borrow();
-      collab.add_plugin(Box::new(sync_plugin));
+      lock.add_plugin(Box::new(sync_plugin));
     }
     {
       let mut lock = collab.write().await;
@@ -768,7 +905,8 @@ impl TestClient {
     )
     .unwrap();
     collab.emit_awareness_state();
-    let collab = Arc::new(RwLock::from(collab)) as CollabRef;
+    let collab = Arc::new(RwLock::from(collab));
+    let collab_ref = collab.clone() as CollabRef;
 
     #[cfg(feature = "collab-sync")]
     {
@@ -782,7 +920,7 @@ impl TestClient {
       let sync_plugin = SyncPlugin::new(
         origin.clone(),
         object,
-        Arc::downgrade(&collab),
+        Arc::downgrade(&collab_ref),
         sink,
         SinkConfig::default(),
         stream,
@@ -792,8 +930,7 @@ impl TestClient {
       );
 
       let lock = collab.read().await;
-      let collab = (*lock).borrow();
-      collab.add_plugin(Box::new(sync_plugin));
+      lock.add_plugin(Box::new(sync_plugin));
     }
     {
       let mut lock = collab.write().await;
@@ -859,8 +996,7 @@ impl TestClient {
 
   pub async fn get_edit_collab_json(&self, object_id: &str) -> Value {
     let lock = self.collabs.get(object_id).unwrap().collab.read().await;
-    let collab = (*lock).borrow();
-    collab.to_json_value()
+    lock.to_json_value()
   }
 
   /// data: [(view_id, meta_json, blob_hex)]
@@ -1021,7 +1157,7 @@ pub async fn assert_server_collab(
   };
 
   if timeout(duration, operation).await.is_err() {
-    eprintln!("json : {}, expected: {}", final_json.lock().await, expected);
+    eprintln!("json:{}\nexpected:{}", final_json.lock().await, expected);
     return Err(anyhow!("time out for the action"));
   }
   Ok(())
@@ -1049,8 +1185,7 @@ pub async fn assert_client_collab_within_secs(
           .collab
           .read()
           .await;
-        let collab = (*lock).borrow();
-        collab.to_json_value()
+        lock.to_json_value()
       } => {
         retry_count += 1;
         if retry_count > 60 {
@@ -1087,8 +1222,7 @@ pub async fn assert_client_collab_include_value(
           .collab
           .read()
           .await;
-        let collab = (*lock).borrow();
-        collab.to_json_value()
+        lock.to_json_value()
       } => {
         retry_count += 1;
         if retry_count > 30 {

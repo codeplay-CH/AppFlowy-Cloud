@@ -34,7 +34,7 @@ services:
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}"]
+      test: [ "CMD", "pg_isready", "-U", "${POSTGRES_USER}" ]
       interval: 5s
       timeout: 5s
       retries: 6
@@ -60,7 +60,7 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "nc", "-z", "localhost", "9999"]
+      test: [ "CMD", "nc", "-z", "localhost", "9999" ]
       interval: 5s
       timeout: 5s
       retries: 6
@@ -134,6 +134,12 @@ services:
       - APPFLOWY_AI_SERVER_HOST=${APPFLOWY_AI_SERVER_HOST}
       - APPFLOWY_AI_SERVER_PORT=${APPFLOWY_AI_SERVER_PORT}
       - APPFLOWY_WEB_URL=${APPFLOWY_WEB_URL}
+      - APPFLOWY_MAILER_SMTP_HOST=${APPFLOWY_MAILER_SMTP_HOST}
+      - APPFLOWY_MAILER_SMTP_PORT=${APPFLOWY_MAILER_SMTP_PORT}
+      - APPFLOWY_MAILER_SMTP_USERNAME=${APPFLOWY_MAILER_SMTP_USERNAME}
+      - APPFLOWY_MAILER_SMTP_EMAIL=${APPFLOWY_MAILER_SMTP_EMAIL}
+      - APPFLOWY_MAILER_SMTP_PASSWORD=${APPFLOWY_MAILER_SMTP_PASSWORD}
+      - APPFLOWY_AI_OPENAI_API_KEY=${APPFLOWY_AI_OPENAI_API_KEY}
     build:
       context: .
       dockerfile: Dockerfile

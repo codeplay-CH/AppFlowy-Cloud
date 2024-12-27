@@ -1,6 +1,7 @@
 use crate::http::log_request_id;
 use crate::Client;
 
+use app_error::AppError;
 use client_api_entity::chat_dto::{
   ChatMessage, CreateAnswerMessageParams, CreateChatMessageParams, CreateChatParams, MessageCursor,
   RepeatedChatMessage, UpdateChatMessageContentParams,
@@ -154,7 +155,17 @@ impl Client {
       .await?
       .timeout(Duration::from_secs(30))
       .send()
-      .await?;
+      .await
+      .map_err(|err| {
+        let app_err = AppError::from(err);
+        if matches!(app_err, AppError::ServiceTemporaryUnavailable(_)) {
+          AppError::AIServiceUnavailable(
+            "AI service temporarily unavailable, please try again later".to_string(),
+          )
+        } else {
+          app_err
+        }
+      })?;
     log_request_id(&resp);
     let stream = AppResponse::<serde_json::Value>::json_response_stream(resp).await?;
     Ok(QuestionStream::new(stream))
@@ -262,6 +273,28 @@ impl Client {
       .into_data()
   }
 
+  pub async fn get_question_message_from_answer_id(
+    &self,
+    workspace_id: &str,
+    chat_id: &str,
+    answer_message_id: i64,
+  ) -> Result<Option<ChatMessage>, AppResponseError> {
+    let url = format!(
+      "{}/api/chat/{workspace_id}/{chat_id}/message/find_question",
+      self.base_url
+    );
+
+    let resp = self
+      .http_client_with_auth(Method::GET, &url)
+      .await?
+      .query(&[("answer_message_id", answer_message_id)])
+      .send()
+      .await?;
+    AppResponse::<Option<ChatMessage>>::from_response(resp)
+      .await?
+      .into_data()
+  }
+
   pub async fn calculate_similarity(
     &self,
     params: CalculateSimilarityParams,
@@ -320,7 +353,7 @@ impl Stream for QuestionStream {
   fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
     let this = self.project();
 
-    return match ready!(this.stream.as_mut().poll_next(cx)) {
+    match ready!(this.stream.as_mut().poll_next(cx)) {
       Some(Ok(value)) => match value {
         Value::Object(mut value) => {
           if let Some(metadata) = value.remove(STREAM_METADATA_KEY) {
@@ -344,6 +377,6 @@ impl Stream for QuestionStream {
       },
       Some(Err(err)) => Poll::Ready(Some(Err(err))),
       None => Poll::Ready(None),
-    };
+    }
   }
 }

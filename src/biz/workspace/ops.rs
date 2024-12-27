@@ -11,7 +11,7 @@ use serde_json::json;
 use sqlx::{types::uuid, PgPool};
 use std::ops::DerefMut;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::instrument;
 use uuid::Uuid;
 use yrs::updates::encoder::Encode;
@@ -19,7 +19,7 @@ use yrs::updates::encoder::Encode;
 use access_control::workspace::WorkspaceAccessControl;
 use app_error::AppError;
 use appflowy_collaborate::collab::storage::CollabAccessControlStorage;
-use database::collab::{upsert_collab_member_with_txn, CollabStorage};
+use database::collab::upsert_collab_member_with_txn;
 use database::file::s3_client_impl::S3BucketStorage;
 use database::pg_row::AFWorkspaceMemberRow;
 
@@ -418,7 +418,7 @@ pub async fn invite_workspace_members(
           workspace_id,
           inviter,
           invitation.email.as_str(),
-          invitation.role,
+          &invitation.role,
         )
         .await?;
         invite_id
@@ -457,26 +457,32 @@ pub async fn invite_workspace_members(
       }
     };
 
-    // send email can be slow, so send email in background
-    let cloned_mailer = mailer.clone();
-    tokio::spawn(async move {
-      if let Err(err) = cloned_mailer
-        .send_workspace_invite(
-          &invitation.email,
-          WorkspaceInviteMailerParam {
-            user_icon_url,
-            username: inviter_name,
-            workspace_name,
-            workspace_icon_url,
-            workspace_member_count,
-            accept_url,
-          },
-        )
-        .await
-      {
-        tracing::error!("Failed to send workspace invite email: {:?}", err);
-      };
-    });
+    if !invitation.skip_email_send {
+      let cloned_mailer = mailer.clone();
+      let email_sending = tokio::spawn(async move {
+        cloned_mailer
+          .send_workspace_invite(
+            &invitation.email,
+            WorkspaceInviteMailerParam {
+              user_icon_url,
+              username: inviter_name,
+              workspace_name,
+              workspace_icon_url,
+              workspace_member_count,
+              accept_url,
+            },
+          )
+          .await
+      });
+      if invitation.wait_email_send {
+        email_sending.await??;
+      }
+    } else {
+      tracing::info!(
+        "Skipping email send for workspace invite to {}",
+        invitation.email
+      );
+    }
   }
 
   txn
@@ -735,7 +741,7 @@ pub async fn broadcast_update(
   oid: &str,
   encoded_update: Vec<u8>,
 ) -> Result<(), AppError> {
-  tracing::info!("broadcasting update to group: {}", oid);
+  tracing::trace!("broadcasting update to group: {}", oid);
   let payload = Message::Sync(SyncMessage::Update(encoded_update)).encode_v1();
   let msg = ClientCollabMessage::ClientUpdateSync {
     data: UpdateSync {
@@ -751,4 +757,32 @@ pub async fn broadcast_update(
     .await?;
 
   Ok(())
+}
+
+/// like [broadcast_update] but in separate tokio task
+/// waits for a maximum of 30 seconds for the broadcast to complete
+pub async fn broadcast_update_with_timeout(
+  collab_storage: Arc<CollabAccessControlStorage>,
+  oid: String,
+  encoded_update: Vec<u8>,
+) -> tokio::task::JoinHandle<()> {
+  tokio::spawn(async move {
+    tracing::info!("broadcasting update to group: {}", oid);
+    let res = match tokio::time::timeout(
+      Duration::from_secs(30),
+      broadcast_update(&collab_storage, &oid, encoded_update),
+    )
+    .await
+    {
+      Ok(res) => res,
+      Err(err) => {
+        tracing::error!("Error while broadcasting the updates: {:?}", err);
+        return;
+      },
+    };
+    match res {
+      Ok(()) => tracing::info!("broadcasted update to group: {}", oid),
+      Err(err) => tracing::error!("Error while broadcasting the updates: {:?}", err),
+    }
+  })
 }

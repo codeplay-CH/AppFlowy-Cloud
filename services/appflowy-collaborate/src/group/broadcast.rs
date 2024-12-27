@@ -23,8 +23,8 @@ use collab_rt_entity::{AckCode, MsgId};
 use collab_rt_entity::{
   AwarenessSync, BroadcastSync, ClientCollabMessage, CollabAck, CollabMessage,
 };
+use collab_rt_protocol::RTProtocolError;
 use collab_rt_protocol::{CollabSyncProtocol, Message, MessageReader, MSG_SYNC, MSG_SYNC_UPDATE};
-use collab_rt_protocol::{RTProtocolError, SyncMessage};
 
 use crate::error::RealtimeError;
 use crate::group::group_init::EditState;
@@ -258,7 +258,7 @@ impl CollabBroadcast {
 
 async fn handle_client_messages<Sink>(
   object_id: &str,
-  message_map: MessageByObjectId,
+  message_by_object_id: MessageByObjectId,
   sink: &mut Sink,
   collab: Arc<RwLock<dyn BorrowMut<Collab> + Send + Sync + 'static>>,
   metrics_calculate: &Arc<CollabRealtimeMetrics>,
@@ -267,7 +267,7 @@ async fn handle_client_messages<Sink>(
   Sink: SinkExt<CollabMessage> + Unpin + 'static,
   <Sink as futures_util::Sink<CollabMessage>>::Error: std::error::Error,
 {
-  for (message_object_id, collab_messages) in message_map {
+  for (message_object_id, collab_messages) in message_by_object_id.into_inner() {
     // Ignore messages where the object_id does not match. This situation should not occur, as
     // [ClientMessageRouter::init_client_communication] is expected to filter out such messages. However,
     // as a precautionary measure, we perform this check to handle any unexpected cases.
@@ -328,9 +328,6 @@ async fn handle_one_client_message(
   // If the payload is empty, we don't need to apply any updates .
   // Currently, only the ping message should has an empty payload.
   if collab_msg.payload().is_empty() {
-    if !matches!(collab_msg, ClientCollabMessage::ClientCollabStateCheck(_)) {
-      error!("receive unexpected empty payload message:{}", collab_msg);
-    }
     return Ok(CollabAck::new(
       message_origin,
       object_id.to_string(),
@@ -407,11 +404,9 @@ async fn handle_message(
   let reader = MessageReader::new(&mut decoder);
   let seq_num = edit_state.edit_count();
   let mut ack_response = None;
-  let mut is_sync_step2 = false;
   for msg in reader {
     match msg {
       Ok(msg) => {
-        is_sync_step2 = matches!(msg, Message::Sync(SyncMessage::SyncStep2(_)));
         match ServerSyncProtocol::new(metrics_calculate.clone())
           .handle_message(message_origin, collab, msg)
           .await
@@ -455,9 +450,6 @@ async fn handle_message(
     }
   }
 
-  if is_sync_step2 {
-    edit_state.set_ready_to_save();
-  }
   Ok(ack_response)
 }
 
