@@ -1,6 +1,7 @@
 use crate::collab_update_sink::{AwarenessUpdateSink, CollabUpdateSink};
 use crate::error::{internal, StreamError};
 use crate::lease::{Lease, LeaseAcquisition};
+use crate::metrics::CollabStreamMetrics;
 use crate::model::{AwarenessStreamUpdate, CollabStreamUpdate, MessageId};
 use crate::stream_group::{StreamConfig, StreamGroup};
 use crate::stream_router::{StreamRouter, StreamRouterOptions};
@@ -21,14 +22,21 @@ pub struct CollabRedisStream {
 impl CollabRedisStream {
   pub const LEASE_TTL: Duration = Duration::from_secs(60);
 
-  pub async fn new(redis_client: redis::Client) -> Result<Self, redis::RedisError> {
+  pub async fn new(
+    redis_client: redis::Client,
+    metrics: Arc<CollabStreamMetrics>,
+  ) -> Result<Self, redis::RedisError> {
     let router_options = StreamRouterOptions {
       worker_count: 60,
       xread_streams: 100,
       xread_block_millis: Some(5000),
       xread_count: None,
     };
-    let stream_router = Arc::new(StreamRouter::with_options(&redis_client, router_options)?);
+    let stream_router = Arc::new(StreamRouter::with_options(
+      &redis_client,
+      metrics,
+      router_options,
+    )?);
     let connection_manager = redis_client.get_connection_manager().await?;
     Ok(Self::new_with_connection_manager(
       connection_manager,
@@ -174,7 +182,7 @@ impl CollabRedisStream {
     }
   }
 
-  pub async fn prune_stream(
+  pub async fn prune_update_stream(
     &self,
     stream_key: &str,
     mut message_id: MessageId,
@@ -193,11 +201,32 @@ impl CollabRedisStream {
     let count = usize::from_redis_value(&value)?;
     drop(conn);
     tracing::debug!(
-      "pruned redis stream `{}` <= `{}` ({} objects)",
+      "pruned redis update stream `{}` <= `{}` ({} objects)",
       stream_key,
       message_id,
       count
     );
     Ok(count)
+  }
+
+  pub async fn prune_awareness_stream(&self, stream_key: &str) -> Result<(), StreamError> {
+    let mut conn = self.connection_manager.clone();
+    let value = conn
+      .send_packed_command(
+        redis::cmd("XTRIM")
+          .arg(stream_key)
+          .arg("MAXLEN")
+          .arg("=")
+          .arg(0),
+      )
+      .await?;
+    let count = usize::from_redis_value(&value)?;
+    drop(conn);
+    tracing::debug!(
+      "pruned redis awareness stream {} ({} objects)",
+      stream_key,
+      count
+    );
+    Ok(())
   }
 }

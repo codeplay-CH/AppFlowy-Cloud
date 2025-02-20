@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use actix_web::web::Data;
 use app_error::AppError;
 use appflowy_collaborate::collab::storage::CollabAccessControlStorage;
 use chrono::DateTime;
@@ -24,16 +25,21 @@ use collab_database::workspace_database::WorkspaceDatabaseBody;
 use collab_document::document::Document;
 use collab_entity::CollabType;
 use collab_entity::EncodedCollab;
-use collab_folder::CollabOrigin;
+use collab_folder::hierarchy_builder::NestedChildViewBuilder;
+use collab_folder::Folder;
 use collab_folder::SectionItem;
+use collab_folder::{CollabOrigin, SpaceInfo};
+use collab_rt_entity::user::RealtimeUser;
 use database::collab::select_last_updated_database_row_ids;
 use database::collab::select_workspace_database_oid;
 use database::collab::{CollabStorage, GetCollabOrigin};
 use database::publish::select_published_view_ids_for_workspace;
+use database::publish::select_published_view_ids_with_publish_info_for_workspace;
 use database::publish::select_workspace_id_for_publish_namespace;
+use database_entity::dto::CollabParams;
 use database_entity::dto::QueryCollab;
 use database_entity::dto::QueryCollabResult;
-use database_entity::dto::{CollabParams, WorkspaceCollabIdentify};
+
 use shared_entity::dto::workspace_dto::AFDatabase;
 use shared_entity::dto::workspace_dto::AFDatabaseField;
 use shared_entity::dto::workspace_dto::AFDatabaseRow;
@@ -42,24 +48,21 @@ use shared_entity::dto::workspace_dto::AFInsertDatabaseField;
 use shared_entity::dto::workspace_dto::DatabaseRowUpdatedItem;
 use shared_entity::dto::workspace_dto::FavoriteFolderView;
 use shared_entity::dto::workspace_dto::FolderViewMinimal;
+use shared_entity::dto::workspace_dto::PublishedViewInfo;
 use shared_entity::dto::workspace_dto::RecentFolderView;
 use shared_entity::dto::workspace_dto::TrashFolderView;
 use sqlx::PgPool;
-use std::ops::DerefMut;
 use yrs::Map;
 
+use crate::api::metrics::AppFlowyWebMetrics;
+use crate::api::ws::RealtimeServerAddr;
+use crate::biz::collab::folder_view::check_if_view_is_space;
 use crate::biz::collab::utils::get_database_row_doc_changes;
 use crate::biz::workspace::ops::broadcast_update_with_timeout;
-use access_control::collab::CollabAccessControl;
-use anyhow::Context;
-use database_entity::dto::{
-  AFCollabMember, InsertCollabMemberParams, QueryCollabMembers, UpdateCollabMemberParams,
-};
+use crate::biz::workspace::page_view::update_workspace_folder_data;
 use shared_entity::dto::workspace_dto::{FolderView, PublishedView};
 use sqlx::types::Uuid;
 use std::collections::HashSet;
-use tracing::{event, trace};
-use validator::Validate;
 
 use super::folder_view::collab_folder_to_folder_view;
 use super::folder_view::section_items_to_favorite_folder_view;
@@ -67,14 +70,12 @@ use super::folder_view::section_items_to_recent_folder_view;
 use super::folder_view::section_items_to_trash_folder_view;
 use super::folder_view::to_dto_folder_view_miminal;
 use super::publish_outline::collab_folder_to_published_outline;
-use super::utils::collab_from_doc_state;
 use super::utils::collab_to_bin;
 use super::utils::create_row_document;
 use super::utils::field_by_id_name_uniq;
 use super::utils::get_latest_collab;
 use super::utils::get_latest_collab_database_body;
 use super::utils::get_latest_collab_database_row_body;
-use super::utils::get_latest_collab_encoded;
 use super::utils::get_latest_collab_folder;
 use super::utils::get_row_details_serde;
 use super::utils::type_option_reader_by_id;
@@ -82,133 +83,8 @@ use super::utils::type_options_serde;
 use super::utils::write_to_database_row;
 use super::utils::CreatedRowDocument;
 use super::utils::DocChanges;
-
-/// Create a new collab member
-/// If the collab member already exists, return [AppError::RecordAlreadyExists]
-/// If the collab member does not exist, create a new one
-pub async fn create_collab_member(
-  pg_pool: &PgPool,
-  params: &InsertCollabMemberParams,
-  collab_access_control: Arc<dyn CollabAccessControl>,
-) -> Result<(), AppError> {
-  params.validate()?;
-
-  let mut transaction = pg_pool
-    .begin()
-    .await
-    .context("acquire transaction to insert collab member")?;
-
-  if database::collab::is_collab_member_exists(
-    params.uid,
-    &params.object_id,
-    transaction.deref_mut(),
-  )
-  .await?
-  {
-    return Err(AppError::RecordAlreadyExists(format!(
-      "Collab member with uid {} and object_id {} already exists",
-      params.uid, params.object_id
-    )));
-  }
-
-  trace!("Inserting collab member: {:?}", params);
-  database::collab::insert_collab_member(
-    params.uid,
-    &params.object_id,
-    &params.access_level,
-    &mut transaction,
-  )
-  .await?;
-
-  collab_access_control
-    .update_access_level_policy(&params.uid, &params.object_id, params.access_level)
-    .await?;
-
-  transaction
-    .commit()
-    .await
-    .context("fail to commit the transaction to insert collab member")?;
-  Ok(())
-}
-
-pub async fn upsert_collab_member(
-  pg_pool: &PgPool,
-  _user_uuid: &Uuid,
-  params: &UpdateCollabMemberParams,
-  collab_access_control: Arc<dyn CollabAccessControl>,
-) -> Result<(), AppError> {
-  params.validate()?;
-  let mut transaction = pg_pool
-    .begin()
-    .await
-    .context("acquire transaction to upsert collab member")?;
-
-  collab_access_control
-    .update_access_level_policy(&params.uid, &params.object_id, params.access_level)
-    .await?;
-
-  database::collab::insert_collab_member(
-    params.uid,
-    &params.object_id,
-    &params.access_level,
-    &mut transaction,
-  )
-  .await?;
-
-  transaction
-    .commit()
-    .await
-    .context("fail to commit the transaction to upsert collab member")?;
-  Ok(())
-}
-
-pub async fn get_collab_member(
-  pg_pool: &PgPool,
-  params: &WorkspaceCollabIdentify,
-) -> Result<AFCollabMember, AppError> {
-  params.validate()?;
-  let collab_member =
-    database::collab::select_collab_member(&params.uid, &params.object_id, pg_pool).await?;
-  Ok(collab_member)
-}
-
-pub async fn delete_collab_member(
-  pg_pool: &PgPool,
-  params: &WorkspaceCollabIdentify,
-  collab_access_control: Arc<dyn CollabAccessControl>,
-) -> Result<(), AppError> {
-  params.validate()?;
-  let mut transaction = pg_pool
-    .begin()
-    .await
-    .context("acquire transaction to remove collab member")?;
-  event!(
-    tracing::Level::DEBUG,
-    "Deleting member:{} from {}",
-    params.uid,
-    params.object_id
-  );
-  database::collab::delete_collab_member(params.uid, &params.object_id, &mut transaction).await?;
-
-  collab_access_control
-    .remove_access_level(&params.uid, &params.object_id)
-    .await?;
-
-  transaction
-    .commit()
-    .await
-    .context("fail to commit the transaction to remove collab member")?;
-  Ok(())
-}
-
-pub async fn get_collab_member_list(
-  pg_pool: &PgPool,
-  params: &QueryCollabMembers,
-) -> Result<Vec<AFCollabMember>, AppError> {
-  params.validate()?;
-  let collab_member = database::collab::select_collab_members(&params.object_id, pg_pool).await?;
-  Ok(collab_member)
-}
+use super::utils::DEFAULT_SPACE_ICON;
+use super::utils::DEFAULT_SPACE_ICON_COLOR;
 
 pub async fn get_user_favorite_folder_views(
   collab_storage: &CollabAccessControlStorage,
@@ -293,10 +169,95 @@ pub async fn get_user_trash_folder_views(
   Ok(section_items_to_trash_folder_view(&section_items, &folder))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn patch_old_workspace_folder(
+  user: RealtimeUser,
+  workspace_id: &str,
+  folder: &mut Folder,
+  child_view_id_without_space: &[String],
+) -> Result<Vec<u8>, AppError> {
+  let encoded_update = {
+    let space_id = Uuid::new_v4().to_string();
+
+    let space_view = NestedChildViewBuilder::new(user.uid, workspace_id.to_string())
+      .with_view_id(space_id.clone())
+      .with_name("General")
+      .with_extra(|extra| {
+        extra
+          .with_space_info(SpaceInfo {
+            space_icon: Some(DEFAULT_SPACE_ICON.to_string()),
+            space_icon_color: Some(DEFAULT_SPACE_ICON_COLOR.to_string()),
+            ..Default::default()
+          })
+          .build()
+      })
+      .build()
+      .view;
+    let mut txn = folder.collab.transact_mut();
+    folder.body.views.insert(&mut txn, space_view, None);
+    for (i, current_view_id) in child_view_id_without_space.iter().enumerate() {
+      let previous_view_id = if i == 0 {
+        None
+      } else {
+        Some(child_view_id_without_space[i - 1].clone())
+      };
+      folder
+        .body
+        .move_nested_view(&mut txn, current_view_id, &space_id, previous_view_id);
+    }
+    txn.encode_update_v1()
+  };
+  Ok(encoded_update)
+}
+
+async fn fix_old_workspace_folder(
+  appflowy_web_metrics: &AppFlowyWebMetrics,
+  server: Data<RealtimeServerAddr>,
+  user: RealtimeUser,
+  mut folder: Folder,
+  workspace_id: Uuid,
+) -> Result<Folder, AppError> {
+  let root_view = folder.get_view(&workspace_id.to_string()).ok_or_else(|| {
+    AppError::InvalidRequest(format!(
+      "Failed to get view for workspace_id: {}",
+      workspace_id
+    ))
+  })?;
+  let direct_workspace_children: Vec<String> = root_view
+    .children
+    .iter()
+    .map(|view_id| view_id.to_string())
+    .collect();
+  let has_at_least_one_space = direct_workspace_children
+    .iter()
+    .filter_map(|view_id| folder.get_view(view_id))
+    .any(|view| check_if_view_is_space(&view));
+  if !has_at_least_one_space {
+    let folder_update = patch_old_workspace_folder(
+      user.clone(),
+      &workspace_id.to_string(),
+      &mut folder,
+      &direct_workspace_children,
+    )?;
+    update_workspace_folder_data(
+      appflowy_web_metrics,
+      server,
+      user,
+      workspace_id,
+      folder_update,
+    )
+    .await?;
+  }
+  Ok(folder)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn get_user_workspace_structure(
+  appflowy_web_metrics: &AppFlowyWebMetrics,
+  server: Data<RealtimeServerAddr>,
   collab_storage: &CollabAccessControlStorage,
   pg_pool: &PgPool,
-  uid: i64,
+  user: RealtimeUser,
   workspace_id: Uuid,
   depth: u32,
   root_view_id: &str,
@@ -310,10 +271,13 @@ pub async fn get_user_workspace_structure(
   }
   let folder = get_latest_collab_folder(
     collab_storage,
-    GetCollabOrigin::User { uid },
+    GetCollabOrigin::User { uid: user.uid },
     &workspace_id.to_string(),
   )
   .await?;
+  let patched_folder =
+    fix_old_workspace_folder(appflowy_web_metrics, server, user, folder, workspace_id).await?;
+
   let publish_view_ids = select_published_view_ids_for_workspace(pg_pool, workspace_id).await?;
   let publish_view_ids: HashSet<String> = publish_view_ids
     .into_iter()
@@ -322,7 +286,7 @@ pub async fn get_user_workspace_structure(
   collab_folder_to_folder_view(
     workspace_id,
     root_view_id,
-    &folder,
+    &patched_folder,
     depth,
     &publish_view_ids,
   )
@@ -335,17 +299,14 @@ pub async fn get_latest_workspace_database(
   workspace_id: Uuid,
 ) -> Result<(String, WorkspaceDatabase), AppError> {
   let workspace_database_oid = select_workspace_database_oid(pg_pool, &workspace_id).await?;
-  let workspace_database_collab = {
-    let encoded_collab = get_latest_collab_encoded(
-      collab_storage,
-      collab_origin,
-      &workspace_id.to_string(),
-      &workspace_database_oid,
-      CollabType::WorkspaceDatabase,
-    )
-    .await?;
-    collab_from_doc_state(encoded_collab.doc_state.to_vec(), &workspace_database_oid)?
-  };
+  let workspace_database_collab = get_latest_collab(
+    collab_storage,
+    collab_origin,
+    &workspace_id.to_string(),
+    &workspace_database_oid,
+    CollabType::WorkspaceDatabase,
+  )
+  .await?;
 
   let workspace_database = WorkspaceDatabase::open(workspace_database_collab)
     .map_err(|err| AppError::Unhandled(format!("failed to open workspace database: {}", err)))?;
@@ -364,13 +325,30 @@ pub async fn get_published_view(
     &workspace_id.to_string(),
   )
   .await?;
-  let publish_view_ids = select_published_view_ids_for_workspace(pg_pool, workspace_id).await?;
-  let publish_view_ids: HashSet<String> = publish_view_ids
-    .into_iter()
-    .map(|id| id.to_string())
-    .collect();
-  let published_view: PublishedView =
-    collab_folder_to_published_outline(&workspace_id.to_string(), &folder, &publish_view_ids)?;
+  let publish_view_ids_with_publish_info =
+    select_published_view_ids_with_publish_info_for_workspace(pg_pool, workspace_id).await?;
+  let publish_view_id_to_info_map: HashMap<String, PublishedViewInfo> =
+    publish_view_ids_with_publish_info
+      .into_iter()
+      .map(|pv| {
+        (
+          pv.view_id.to_string(),
+          PublishedViewInfo {
+            publisher_email: pv.publisher_email.clone(),
+            publish_name: pv.publish_name.clone(),
+            publish_timestamp: pv.publish_timestamp,
+            comments_enabled: pv.comments_enabled,
+            duplicate_enabled: pv.duplicate_enabled,
+          },
+        )
+      })
+      .collect();
+
+  let published_view: PublishedView = collab_folder_to_published_outline(
+    &workspace_id.to_string(),
+    &folder,
+    &publish_view_id_to_info_map,
+  )?;
   Ok(published_view)
 }
 

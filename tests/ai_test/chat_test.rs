@@ -1,6 +1,10 @@
-use crate::ai_test::util::read_text_from_asset;
+use crate::ai_test::util::{extract_image_url, read_text_from_asset};
+use std::time::Duration;
 
-use assert_json_diff::{assert_json_eq, assert_json_include};
+use appflowy_ai_client::dto::{
+  ChatQuestionQuery, OutputContent, OutputContentMetadata, OutputLayout, ResponseFormat,
+};
+use assert_json_diff::assert_json_include;
 use client_api::entity::{QuestionStream, QuestionStreamValue};
 use client_api_test::{ai_test_enabled, TestClient};
 use futures_util::StreamExt;
@@ -220,35 +224,17 @@ async fn chat_qa_test() {
     .create_question(&workspace_id, &chat_id, params)
     .await
     .unwrap();
+  let expected = json!({
+      "id": "123",
+      "name": "test context",
+      "source": "user added",
+      "extra": {
+          "created_at": 123
+      }
+  });
   assert_json_include!(
-    actual: question.meta_data,
-    expected: json!([
-      {
-        "id": "123",
-        "name": "test context",
-        "source": "user added",
-        "extra": {
-            "created_at": 123
-        }
-      }
-    ])
-  );
-
-  let answer = test_client
-    .api_client
-    .get_answer(&workspace_id, &chat_id, question.message_id)
-    .await
-    .unwrap();
-  assert!(answer.content.contains("Singapore"));
-  assert_json_eq!(
-    answer.meta_data,
-    json!([
-      {
-        "id": "123",
-        "name": "test context",
-        "source": "user added",
-      }
-    ])
+      actual: json!(question.meta_data[0]),
+      expected: expected
   );
 
   let related_questions = test_client
@@ -294,59 +280,151 @@ async fn generate_chat_message_answer_test() {
   assert!(!answer.is_empty());
 }
 
-// #[tokio::test]
-// async fn update_chat_message_test() {
-//   if !ai_test_enabled() {
-//     return;
-//   }
+#[tokio::test]
+async fn get_format_question_message_test() {
+  if !ai_test_enabled() {
+    return;
+  }
 
-//   let test_client = TestClient::new_user_without_ws_conn().await;
-//   let workspace_id = test_client.workspace_id().await;
-//   let chat_id = uuid::Uuid::new_v4().to_string();
-//   let params = CreateChatParams {
-//     chat_id: chat_id.clone(),
-//     name: "my second chat".to_string(),
-//     rag_ids: vec![],
-//   };
+  let test_client = TestClient::new_user_without_ws_conn().await;
+  let workspace_id = test_client.workspace_id().await;
+  let chat_id = uuid::Uuid::new_v4().to_string();
+  let params = CreateChatParams {
+    chat_id: chat_id.clone(),
+    name: "my ai chat".to_string(),
+    rag_ids: vec![],
+  };
 
-//   test_client
-//     .api_client
-//     .create_chat(&workspace_id, params)
-//     .await
-//     .unwrap();
+  test_client
+    .api_client
+    .create_chat(&workspace_id, params)
+    .await
+    .unwrap();
 
-//   let params = CreateChatMessageParams::new_user("where is singapore?");
-//   let stream = test_client
-//     .api_client
-//     .create_chat_message(&workspace_id, &chat_id, params)
-//     .await
-//     .unwrap();
-//   let messages: Vec<ChatMessage> = stream.map(|message| message.unwrap()).collect().await;
-//   assert_eq!(messages.len(), 2);
+  let params = CreateChatMessageParams::new_user(
+    "what is the different between Rust and c++? Give me three points",
+  );
+  let question = test_client
+    .api_client
+    .create_question(&workspace_id, &chat_id, params)
+    .await
+    .unwrap();
 
-//   let params = UpdateChatMessageContentParams {
-//     chat_id: chat_id.clone(),
-//     message_id: messages[0].message_id,
-//     content: "where is China?".to_string(),
-//   };
-//   test_client
-//     .api_client
-//     .update_chat_message(&workspace_id, &chat_id, params)
-//     .await
-//     .unwrap();
+  let query = ChatQuestionQuery {
+    chat_id,
+    question_id: question.message_id,
+    format: ResponseFormat {
+      output_layout: OutputLayout::SimpleTable,
+      output_content: OutputContent::TEXT,
+      output_content_metadata: None,
+    },
+  };
 
-//   let remote_messages = test_client
-//     .api_client
-//     .get_chat_messages(&workspace_id, &chat_id, MessageCursor::NextBack, 2)
-//     .await
-//     .unwrap()
-//     .messages;
-//   assert_eq!(remote_messages[0].content, "where is China?");
-//   assert_eq!(remote_messages.len(), 2);
+  let answer_stream = test_client
+    .api_client
+    .stream_answer_v3(&workspace_id, query)
+    .await
+    .unwrap();
+  let answer = collect_answer(answer_stream).await;
+  println!("answer:\n{}", answer);
+  assert!(!answer.is_empty());
+}
 
-//   // when the question was updated, the answer should be different
-//   assert_ne!(remote_messages[1].content, messages[1].content);
-// }
+#[tokio::test]
+async fn get_text_with_image_message_test() {
+  if !ai_test_enabled() {
+    return;
+  }
+
+  let test_client = TestClient::new_user_without_ws_conn().await;
+  let workspace_id = test_client.workspace_id().await;
+  let chat_id = uuid::Uuid::new_v4().to_string();
+  let params = CreateChatParams {
+    chat_id: chat_id.clone(),
+    name: "my ai chat".to_string(),
+    rag_ids: vec![],
+  };
+
+  test_client
+    .api_client
+    .create_chat(&workspace_id, params)
+    .await
+    .unwrap();
+
+  let params = CreateChatMessageParams::new_user(
+    "I have a little cat. It is black with big eyes, short legs and a long tail",
+  );
+  let question = test_client
+    .api_client
+    .create_question(&workspace_id, &chat_id, params)
+    .await
+    .unwrap();
+
+  let query = ChatQuestionQuery {
+    chat_id: chat_id.clone(),
+    question_id: question.message_id,
+    format: ResponseFormat {
+      output_layout: OutputLayout::SimpleTable,
+      output_content: OutputContent::RichTextImage,
+      output_content_metadata: Some(OutputContentMetadata {
+        custom_image_prompt: None,
+        image_model: "dall-e-3".to_string(),
+        size: None,
+        quality: None,
+      }),
+    },
+  };
+
+  let answer_stream = test_client
+    .api_client
+    .stream_answer_v3(&workspace_id, query)
+    .await
+    .unwrap();
+  let answer = collect_answer(answer_stream).await;
+  println!("answer:\n{}", answer);
+  let image_url = extract_image_url(&answer).unwrap();
+  let (workspace_id_2, chat_id_2, file_id_2) = test_client
+    .api_client
+    .parse_blob_url_v1(&image_url)
+    .unwrap();
+  assert_eq!(workspace_id, workspace_id_2);
+  assert_eq!(chat_id, chat_id_2);
+
+  let mut retries = 6;
+  let retry_interval = Duration::from_secs(20);
+  let mut last_error = None;
+
+  // The image will be generated in the background, so we need to retry until it's available
+  while retries > 0 {
+    match test_client
+      .api_client
+      .get_blob_v1(&workspace_id_2, &chat_id_2, &file_id_2)
+      .await
+    {
+      Ok(_) => {
+        // Success, exit the loop
+        last_error = None;
+        break;
+      },
+      Err(err) => {
+        eprintln!("Failed to get blob: {:?}", err);
+        // Save the error and retry
+        last_error = Some(err);
+        retries -= 1;
+      },
+    }
+
+    if retries > 0 {
+      tokio::time::sleep(retry_interval).await;
+    }
+  }
+
+  if let Some(err) = last_error {
+    panic!("Failed to get blob after retries: {:?}", err);
+  }
+
+  assert!(!answer.is_empty());
+}
 
 #[tokio::test]
 async fn get_question_message_test() {
@@ -406,6 +484,24 @@ async fn get_question_message_test() {
   assert_eq!(find_question.reply_message_id.unwrap(), answer.message_id);
 }
 
+#[tokio::test]
+async fn get_model_list_test() {
+  if !ai_test_enabled() {
+    return;
+  }
+  let test_client = TestClient::new_user().await;
+  let workspace_id = test_client.workspace_id().await;
+  let models = test_client
+    .api_client
+    .get_model_list(&workspace_id)
+    .await
+    .unwrap()
+    .models;
+  assert!(!models.is_empty());
+  assert!(models.len() >= 5, "models.len() = {}", models.len());
+  println!("models: {:?}", models);
+}
+
 async fn collect_answer(mut stream: QuestionStream) -> String {
   let mut answer = String::new();
   while let Some(value) = stream.next().await {
@@ -414,6 +510,7 @@ async fn collect_answer(mut stream: QuestionStream) -> String {
         answer.push_str(&value);
       },
       QuestionStreamValue::Metadata { .. } => {},
+      QuestionStreamValue::KeepAlive => {},
     }
   }
   answer
